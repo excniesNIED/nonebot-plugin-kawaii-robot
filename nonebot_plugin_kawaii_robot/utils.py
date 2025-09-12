@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from typing import TypedDict
 
 from nonebot.matcher import current_bot, current_event, current_matcher
-from nonebot_plugin_alconna.uniseg import At, Reply, UniMessage, get_message_id
+from nonebot_plugin_alconna.uniseg import At, Image, Reply, UniMessage, get_message_id
 from nonebot_plugin_uninfo import Member, Session, User
 
 from .config import config
@@ -13,6 +13,8 @@ from .const import NICKNAME, ReplyDictType
 
 SEG_SAMPLE = "{segment}"
 SEG_REGEX = re.compile(r"(?P<h>[^\{])" + re.escape(SEG_SAMPLE) + r"(?P<t>[^\}])")
+# 正则表达式，用于手动匹配和提取图片标签及其URL
+IMAGE_TAG_REGEX = re.compile(r'\{:Image\(url=\"([^\"]+)\"\)\}')
 
 DEFAULT_USER_CALLING = "你"
 
@@ -109,9 +111,36 @@ def format_vars(
     builtin: BuiltInVarDict,
     **extra,
 ) -> list[UniMessage]:
-    return [
-        UniMessage.template(seg).format(**builtin, **extra) for seg in split_seg(string)
-    ]
+    """
+    【已修改】
+    重写此函数以手动处理Image标签，绕过alconna模板解析器的bug。
+    """
+    final_messages = []
+    for seg in split_seg(string):
+        # 使用正则表达式分割字符串，将文本和图片URL分开
+        # 例如: "文本1{:Image(url="URL")}文本2" -> ['文本1', 'URL', '文本2']
+        parts = IMAGE_TAG_REGEX.split(seg)
+
+        if len(parts) == 1:  # 没有找到图片，按原方式处理
+            final_messages.append(UniMessage.template(seg).format(**builtin, **extra))
+            continue
+
+        # 找到了图片，手动构建UniMessage
+        current_message = UniMessage()
+        for i, part in enumerate(parts):
+            if i % 2 == 0:  # 偶数索引是文本部分
+                if part:
+                    # 文本部分仍然使用模板格式化，以支持 {username} 等变量
+                    current_message.extend(
+                        UniMessage.template(part).format(**builtin, **extra)
+                    )
+            else:  # 奇数索引是正则表达式捕获到的URL部分
+                current_message.append(Image(url=part))
+
+        if current_message:
+            final_messages.append(current_message)
+
+    return final_messages
 
 
 async def get_builtin_vars_from_ev(ss: Session) -> BuiltInVarDict:

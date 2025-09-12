@@ -186,7 +186,7 @@ async def repeat_rule(event: BaseEvent, ss: Uninfo) -> bool:
         raw = event.get_message()
     except ValueError:
         return False
-    msg = repr(UniMessage.of(raw))
+    msg = str(raw)
     return RepeatInfo.get(ss.scene_path).count(event.get_user_id(), msg)
 
 
