@@ -1,21 +1,42 @@
 # __main__.py (整合 RAG + Gemini + kawaii-robot 词库)
 
+import asyncio
 import configparser
+import random
 import google.generativeai as genai
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from collections import defaultdict
 
-from nonebot import on_message
+from nonebot import on_message, on_notice, on_command
 from nonebot.params import Depends
 from nonebot.log import logger
 from nonebot.rule import to_me
 from nonebot.matcher import Matcher
-from nonebot.adapters.onebot.v11 import MessageEvent, GroupMessageEvent
+from nonebot.adapters.onebot.v11 import (
+    MessageEvent, 
+    GroupMessageEvent, 
+    PrivateMessageEvent,
+    PokeNotifyEvent,
+    Message
+)
 
 from nonebot_plugin_uninfo import get_session, Session
-from .data_source import LOADED_REPLY_DICT
-from .utils import search_reply_dict, choice_reply_from_ev, finish_multi_msg
+from .data_source import (
+    LOADED_REPLY_DICT, 
+    LOADED_POKE_REPLY, 
+    LOADED_UNKNOWN_REPLY,
+    LOADED_INTERRUPT_MSG,
+    reload_replies
+)
+from .utils import (
+    search_reply_dict, 
+    choice_reply_from_ev, 
+    finish_multi_msg,
+    check_percentage
+)
+from .config import config
 
 # --- 全局配置和变量 ---
 config_path = Path(__file__).parent / "gemini_config.ini"
@@ -23,6 +44,10 @@ db_path = Path(__file__).parent / "embeddings_database.pkl"
 gemini_model = None
 df_embeddings = None
 enabled_groups = []
+
+# 复读检测数据结构
+group_repeat_data = defaultdict(lambda: {"message": "", "count": 0, "users": set()})
+repeat_lock = defaultdict(bool)  # 防止重复触发
 
 # --- 初始化模块 ---
 def setup_plugin():
@@ -159,16 +184,129 @@ async def get_general_gemini_response(prompt: str) -> str:
         logger.error(f"调用通用 Gemini 对话时发生错误: {e}")
         return "呜...出错了，请联系我的主人检查一下后台日志吧。"
 
-# --- 创建响应器 ---
+# --- 戳一戳处理器 ---
+poke_matcher = on_notice(priority=5, block=False)
+
+@poke_matcher.handle()
+async def _(event: PokeNotifyEvent, ss: Session = Depends(get_session)):
+    if config.leaf_poke_rand == -1:
+        return
+    
+    if event.target_id != event.self_id:
+        return  # 不是戳机器人的
+    
+    if not check_percentage(config.leaf_poke_rand):
+        return
+    
+    await asyncio.sleep(random.uniform(*config.leaf_poke_action_delay))
+    
+    # 选择戳一戳回复
+    reply_list = LOADED_POKE_REPLY if LOADED_POKE_REPLY else ["戳我干嘛~"]
+    formatted_messages = await choice_reply_from_ev(ss, reply_list)
+    await finish_multi_msg(formatted_messages)
+
+# --- 复读检测处理器 ---
+repeat_matcher = on_message(priority=20, block=False)
+
+@repeat_matcher.handle()
+async def _(event: GroupMessageEvent, ss: Session = Depends(get_session)):
+    group_id = str(event.group_id)
+    user_id = event.get_user_id()
+    message_text = event.get_plaintext().strip()
+    
+    if not message_text or len(message_text) > 50:  # 忽略空消息和过长消息
+        return
+    
+    # 忽略机器人自己的消息
+    if user_id == str(event.self_id):
+        return
+    
+    repeat_data = group_repeat_data[group_id]
+    
+    # 检查是否为相同消息
+    if message_text == repeat_data["message"]:
+        if config.leaf_force_different_user:
+            if user_id not in repeat_data["users"]:
+                repeat_data["count"] += 1
+                repeat_data["users"].add(user_id)
+        else:
+            repeat_data["count"] += 1
+    else:
+        # 重置复读数据
+        repeat_data["message"] = message_text
+        repeat_data["count"] = 1
+        repeat_data["users"] = {user_id}
+        repeat_lock[group_id] = False
+    
+    # 检查是否触发复读或打断
+    min_count, max_count = config.leaf_repeater_limit
+    if repeat_data["count"] >= min_count and not repeat_lock[group_id]:
+        if repeat_data["count"] <= max_count:
+            # 决定是复读还是打断
+            if check_percentage(config.leaf_interrupt):
+                # 打断复读
+                if not config.leaf_interrupt_continue:
+                    repeat_lock[group_id] = True
+                interrupt_list = LOADED_INTERRUPT_MSG if LOADED_INTERRUPT_MSG else ["打断！"]
+                formatted_messages = await choice_reply_from_ev(ss, interrupt_list)
+                await finish_multi_msg(formatted_messages)
+            else:
+                # 参与复读
+                if not config.leaf_repeat_continue:
+                    repeat_lock[group_id] = True
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+                await repeat_matcher.send(Message(message_text))
+
+# --- 非@消息处理器 ---
+casual_matcher = on_message(priority=99, block=False)
+
+@casual_matcher.handle()
+async def _(event: MessageEvent, ss: Session = Depends(get_session)):
+    # 检查是否为@消息，如果是则跳过（由主处理器处理）
+    if event.is_tome():
+        return
+    
+    # 检查是否需要@才能触发词库回复
+    if config.leaf_need_at:
+        return
+    
+    # 检查权限设置
+    if config.leaf_permission == "GROUP" and isinstance(event, PrivateMessageEvent):
+        return
+    
+    # 检查忽略词
+    msg = event.get_plaintext().strip()
+    if not msg:
+        return
+    
+    for ignore_word in config.leaf_ignore:
+        if msg.startswith(ignore_word):
+            return
+    
+    # 概率检查
+    if not check_percentage(config.leaf_trigger_percent):
+        return
+    
+    # 搜索词库
+    if reply_list := search_reply_dict(LOADED_REPLY_DICT, msg):
+        logger.info(f"非@消息在本地词库命中: '{msg}'")
+        formatted_messages = await choice_reply_from_ev(ss, reply_list)
+        await finish_multi_msg(formatted_messages)
+
+# --- 主@消息处理器 ---
 search_matcher = on_message(
     rule=to_me(),
-    priority=10, # 保持较高优先级，但可以根据需要调整
+    priority=50,  # 调整优先级，避免与banword等插件冲突
     block=True
 )
 
 # --- 主处理函数 ---
 @search_matcher.handle()
 async def _(event: MessageEvent, ss: Session = Depends(get_session)):
+    # 检查回复模式设置
+    if config.leaf_reply_type == -1:
+        return  # 关闭全部@回复
+    
     msg = event.get_plaintext().strip()
     if not msg:
         return
@@ -180,7 +318,15 @@ async def _(event: MessageEvent, ss: Session = Depends(get_session)):
         await finish_multi_msg(formatted_messages)
         return
 
-    # AI 功能的权限检查
+    # 如果设置为仅启用词库回复，则不进行AI回复
+    if config.leaf_reply_type == 0:
+        # 使用未知回复
+        if LOADED_UNKNOWN_REPLY:
+            formatted_messages = await choice_reply_from_ev(ss, LOADED_UNKNOWN_REPLY)
+            await finish_multi_msg(formatted_messages)
+        return
+
+    # AI 功能的权限检查（仅在启用所有回复时）
     if isinstance(event, GroupMessageEvent):
         if enabled_groups and str(event.group_id) not in enabled_groups:
             logger.info(f"群聊 {event.group_id} 未在AI对话白名单中，已跳过。")
@@ -195,3 +341,38 @@ async def _(event: MessageEvent, ss: Session = Depends(get_session)):
     # 步骤 3: Fallback 到通用对话模型
     general_response_text = await get_general_gemini_response(msg)
     await search_matcher.finish(general_response_text)
+
+# --- 重载词库命令处理器 ---
+if config.leaf_register_reload_command:
+    reload_matcher = on_command("重载词库", priority=1, block=True)
+    
+    @reload_matcher.handle()
+    async def _(event: MessageEvent):
+        # 简单的权限检查 - 只允许超级用户或群管理员使用
+        user_id = event.get_user_id()
+        
+        # 检查是否为超级用户
+        from nonebot import get_driver
+        driver = get_driver()
+        superusers = driver.config.superusers
+        
+        is_superuser = user_id in superusers
+        is_admin = False
+        
+        # 如果是群聊，检查是否为管理员
+        if isinstance(event, GroupMessageEvent):
+            # 这里可以添加更详细的权限检查逻辑
+            # 为了简化，暂时只允许超级用户使用
+            pass
+        
+        if not is_superuser:
+            await reload_matcher.finish("只有超级用户可以使用此命令喵~")
+            return
+        
+        try:
+            await reload_matcher.send("开始重载词库...")
+            await reload_replies()
+            await reload_matcher.finish("词库重载完成喵~")
+        except Exception as e:
+            logger.error(f"重载词库失败: {e}")
+            await reload_matcher.finish(f"词库重载失败: {str(e)}")
