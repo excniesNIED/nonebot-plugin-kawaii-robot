@@ -4,6 +4,7 @@ import asyncio
 import configparser
 import random
 import google.generativeai as genai
+from openai import OpenAI
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -40,8 +41,11 @@ from .config import config
 
 # --- 全局配置和变量 ---
 config_path = Path(__file__).parent / "gemini_config.ini"
+openai_config_path = Path(__file__).parent / "openai_config.ini"
 db_path = Path(__file__).parent / "embeddings_database.pkl"
 gemini_model = None
+openai_client = None
+openai_embedding_model = None
 df_embeddings = None
 enabled_groups = []
 
@@ -52,7 +56,7 @@ repeat_lock = defaultdict(bool)  # 防止重复触发
 # --- 初始化模块 ---
 def setup_plugin():
     """在插件加载时执行所有初始化操作"""
-    global gemini_model, df_embeddings, enabled_groups
+    global gemini_model, openai_client, openai_embedding_model, df_embeddings, enabled_groups
 
     # 1. 加载 Gemini 配置
     try:
@@ -88,7 +92,28 @@ def setup_plugin():
         logger.error(f"加载 Gemini 配置或初始化模型失败: {e}")
         gemini_model = None
 
-    # 2. 加载 Embeddings 数据库
+    # 2. 加载 OpenAI 配置 (用于 RAG 检索)
+    try:
+        if not openai_config_path.exists():
+             logger.warning("配置文件 'openai_config.ini' 不存在，知识库检索功能将无法使用。")
+        else:
+            openai_config = configparser.ConfigParser()
+            openai_config.read(openai_config_path, encoding='utf-8')
+
+            api_url = openai_config.get('openai', 'api_url')
+            api_key = openai_config.get('openai', 'api_key')
+            openai_embedding_model = openai_config.get('openai', 'embedding_model_id')
+
+            if not all([api_url, api_key, openai_embedding_model]):
+                 raise ValueError("请确保 openai_config.ini 中已正确配置 api_url, api_key, 和 embedding_model_id。")
+
+            openai_client = OpenAI(base_url=api_url, api_key=api_key)
+            logger.info(f"OpenAI 客户端初始化成功 (Model: {openai_embedding_model})，用于知识库检索。")
+    except Exception as e:
+        logger.error(f"加载 OpenAI 配置或初始化客户端失败: {e}")
+        openai_client = None
+
+    # 3. 加载 Embeddings 数据库
     try:
         if db_path.exists():
             df_embeddings = pd.read_pickle(db_path)
@@ -104,17 +129,16 @@ setup_plugin()
 
 # --- RAG 和 AI 对话核心函数 ---
 def find_best_passage(query: str, dataframe: pd.DataFrame, top_k=3):
-    """在向量数据库中查找与问题最相关的文本块"""
-    if dataframe is None or dataframe.empty:
+    """【使用 OpenAI API】在向量数据库中查找与问题最相关的文本块"""
+    if dataframe is None or dataframe.empty or openai_client is None:
         return None
 
     try:
-        query_embedding_result = genai.embed_content(
-            model='embedding-001',
-            content=query,
-            task_type="retrieval_query" # 用于检索的查询
+        response = openai_client.embeddings.create(
+            input=[query],
+            model=openai_embedding_model
         )
-        query_embedding = query_embedding_result['embedding']
+        query_embedding = response.data[0].embedding
 
         # 计算点积相似度
         dot_products = np.dot(np.stack(dataframe['embeddings']), query_embedding)
@@ -125,14 +149,9 @@ def find_best_passage(query: str, dataframe: pd.DataFrame, top_k=3):
         # 拼接最相关的文本块作为上下文
         context = "\n---\n".join(dataframe.iloc[idx]['text'] for idx in top_indices)
         
-        # 你可以增加一个相似度阈值判断，如果最高的相似度都太低，可以认为没有找到相关内容
-        # max_similarity = dot_products[top_indices[0]]
-        # if max_similarity < 0.7: # 阈值需要根据你的数据进行调整
-        #     return None
-
         return context
     except Exception as e:
-        logger.error(f"检索知识库时发生错误: {e}")
+        logger.error(f"使用 OpenAI API 检索知识库时发生错误: {e}")
         return None
 
 async def get_rag_response(prompt: str) -> str | None:
@@ -140,7 +159,7 @@ async def get_rag_response(prompt: str) -> str | None:
     if not gemini_model or df_embeddings is None:
         return None
 
-    logger.info("本地词库未命中，开始在知识库中检索...")
+    logger.info("本地词库未命中，开始在知识库中检索 (using OpenAI Embeddings)...")
     relevant_passage = find_best_passage(prompt, df_embeddings)
 
     if not relevant_passage:
